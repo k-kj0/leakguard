@@ -1,9 +1,25 @@
+
 import numpy as np
-from leakguard.checks import (check_causality, check_data_integrity,
-                              label_overlap_fraction)
-from leakguard.cv import naive_kfold, purged_walk_forward
-from leakguard.features import build_dataset, build_features, build_features_leaky
+
+from leakguard.checks import (
+    check_causality,
+    check_data_integrity,
+)
+
+from leakguard.cv import (
+    label_overlap_fraction,
+    naive_kfold,
+    purged_walk_forward,
+)
+
+from leakguard.features import (
+    build_dataset,
+    build_features,
+    build_features_leaky,
+)
+
 from leakguard.simulate import simulate_order_book
+
 
 H = 30
 df = simulate_order_book(n=4000, seed=1)
