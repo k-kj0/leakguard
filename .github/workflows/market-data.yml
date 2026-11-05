@@ -1,0 +1,56 @@
+
+name: Fetch Public Market Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: "Coinbase product ID"
+        required: true
+        default: "BTC-USD"
+        type: string
+      depth:
+        description: "Number of price levels per side"
+        required: true
+        default: "10"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  fetch-snapshot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Fetch Coinbase Level 2 snapshot
+        env:
+          PRODUCT_ID: ${{ inputs.product }}
+          BOOK_DEPTH: ${{ inputs.depth }}
+        run: |
+          python -m leakguard.market_data \
+            --product "$PRODUCT_ID" \
+            --depth "$BOOK_DEPTH" \
+            --out "results/coinbase_snapshot.csv"
+
+      - name: Show snapshot metadata
+        run: |
+          cat results/coinbase_snapshot.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload market data
+        uses: actions/upload-artifact@v4
+        with:
+          name: coinbase-market-data
+          path: results/coinbase_snapshot.*
+          if-no-files-found: error
