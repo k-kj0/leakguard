@@ -93,6 +93,47 @@ The snapshot represents the book immediately after a specified sequence number. 
 
 A zero size deletes a price level. A positive size inserts or replaces a price level.
 
+
+## Public Market Data Integration
+
+Leakguard includes a public Coinbase Exchange Level 2 snapshot adapter.
+
+It fetches aggregated bid and ask levels without API credentials,
+validates the response, preserves the exchange sequence number,
+and normalizes the book into a side/price/size table.
+
+### Run locally
+
+```bash
+python -m leakguard.market_data \
+  --product BTC-USD \
+  --depth 10 \
+  --out data/coinbase_btc_usd_snapshot.csv
+```
+
+The command writes:
+- A normalized CSV snapshot.
+- A JSON metadata sidecar containing the exchange, product,
+  sequence number, depth and local receipt timestamp.
+
+### Run through GitHub Actions
+
+Open Actions → Fetch Public Market Data → Run workflow.
+
+Choose a product ID such as BTC-USD and the requested depth.
+The resulting CSV and JSON are uploaded as a workflow artifact.
+
+### Data limitations
+
+A REST snapshot is a point-in-time observation, not a historical
+time series. The snapshot's local receipt timestamp is not the
+exchange event timestamp.
+
+The current adapter does not yet subscribe to WebSocket updates,
+recover missed messages, or guarantee continuity between snapshots.
+Those capabilities belong to the exchange-specific streaming
+and reconstruction layer.
+
 ### Sequence auditing
 
 The sequence auditor detects:
