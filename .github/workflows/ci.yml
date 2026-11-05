@@ -1,18 +1,32 @@
 name: CI
+
 on: [push, pull_request]
+
 jobs:
   test-and-run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-      - run: pip install -r requirements.txt
-      - run: pytest -q
-      - run: python -m leakguard.experiment --n 30000 --horizon 50 --seed 7
-      - uses: actions/upload-artifact@v4
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run automated tests
+        run: pytest -q
+
+      - name: Run research experiment
+        run: python -m leakguard.experiment --n 30000 --horizon 50
+
+      - name: Upload experiment report
+        uses: actions/upload-artifact@v4
         with:
-          name: experiment-report
+          name: leakguard-report
           path: results/
