@@ -1,6 +1,13 @@
-name: CI
 
-on: [push, pull_request]
+name: Leakguard CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test-and-run:
@@ -17,16 +24,28 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt
 
       - name: Run automated tests
-        run: pytest -q
+        run: python -m pytest -q
 
       - name: Run research experiment
         run: python -m leakguard.experiment --n 30000 --horizon 50
 
-      - name: Upload experiment report
+      - name: Display research report
+        if: always()
+        run: |
+          if [ -f results/latest.md ]; then
+            cat results/latest.md
+            cat results/latest.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Research report was not generated."
+          fi
+
+      - name: Upload report artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: leakguard-report
           path: results/
+          if-no-files-found: ignore
