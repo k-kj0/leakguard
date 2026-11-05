@@ -1,28 +1,101 @@
-"""Cross-validation that respects time.
+"""Chronological walk-forward validation with label-window purging."""
 
-A label at row i is built from prices up to row i+horizon, so label windows of
-neighbouring rows OVERLAP. Ordinary shuffled K-fold puts one neighbour in train
-and the other in test, so the model effectively sees test answers. Fix:
-walk forward in time and PURGE (drop) training rows whose label window
-reaches into the test block, plus an optional EMBARGO gap.
-"""
 import numpy as np
-from sklearn.model_selection import KFold
 
 
 def naive_kfold(n: int, n_splits: int = 5, seed: int = 0):
-    kf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    return [(tr, te) for tr, te in kf.split(np.arange(n))]
+    """Negative-control split: shuffled and unsuitable for time series."""
+
+    from sklearn.model_selection import KFold
+
+    return [
+        (tr, te)
+        for tr, te in KFold(
+            n_splits=n_splits,
+            shuffle=True,
+            random_state=seed,
+        ).split(np.arange(n))
+    ]
 
 
-def purged_walk_forward(n: int, horizon: int, n_splits: int = 5,
-                        initial_train_frac: float = 0.4, embargo: int = 0):
-    start = int(n * initial_train_frac)
-    edges = np.linspace(start, n, n_splits + 1).astype(int)
+def purged_walk_forward(
+    n: int,
+    horizon: int,
+    n_splits: int = 5,
+    initial_train_frac: float = 0.4,
+    embargo: int = 0,
+):
+    """Expanding-window splits with training-label purging."""
+
+    if n <= 0 or horizon < 1 or n_splits < 1:
+        raise ValueError(
+            "n, horizon and n_splits must be positive"
+        )
+
+    if not 0 < initial_train_frac < 1:
+        raise ValueError(
+            "initial_train_frac must be between 0 and 1"
+        )
+
+    if embargo < 0:
+        raise ValueError("embargo cannot be negative")
+
+    edges = np.linspace(
+        int(n * initial_train_frac),
+        n,
+        n_splits + 1,
+    ).astype(int)
+
     splits = []
-    for a, b in zip(edges[:-1], edges[1:]):
-        train_end = a - horizon - embargo      # last train label window ends before test starts
-        if train_end <= 0:
+
+    for start, end in zip(edges[:-1], edges[1:]):
+
+        train_end = start - horizon - embargo
+
+        if train_end <= 0 or end <= start:
             continue
-        splits.append((np.arange(0, train_end), np.arange(a, b)))
+
+        train = np.arange(0, train_end)
+        test = np.arange(start, end)
+
+        if len(train) and len(test):
+            splits.append((train, test))
+
     return splits
+
+
+def label_overlap_fraction(
+    train_idx,
+    test_idx,
+    horizon: int,
+    n: int,
+) -> float:
+    """Fraction of training-label intervals touching test-label intervals."""
+
+    train_idx = np.asarray(train_idx)
+    test_idx = np.asarray(test_idx)
+
+    if len(train_idx) == 0:
+        return 0.0
+
+    test_starts = np.sort(test_idx)
+
+    overlap = np.zeros(len(train_idx), dtype=bool)
+
+    for j, i in enumerate(train_idx):
+
+        left = np.searchsorted(
+            test_starts,
+            i - horizon,
+            side="left",
+        )
+
+        right = np.searchsorted(
+            test_starts,
+            i + horizon,
+            side="right",
+        )
+
+        overlap[j] = right > left
+
+    return float(overlap.mean())
