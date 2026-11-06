@@ -1,5 +1,5 @@
 
-"""Capture and reconstruct Coinbase Exchange Level 2 WebSocket data.
+"""Capture Coinbase Advanced Trade Level 2 market data.
 
 This is a research-data collector, not a production trading connection.
 """
@@ -18,7 +18,7 @@ import pandas as pd
 import websocket
 
 
-COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com"
 
 
 class CoinbaseWebSocketError(Exception):
@@ -26,13 +26,8 @@ class CoinbaseWebSocketError(Exception):
 
 
 def _exchange_time(message: dict[str, Any]) -> str | None:
-    """Return an exchange timestamp in UTC, or None if not supplied.
-
-    Coinbase Level 2 snapshots may not contain a timestamp.
-    Incremental updates normally do.
-    We never fabricate an exchange timestamp from the local clock.
-    """
-    value = message.get("time")
+    """Return an exchange timestamp in UTC, or None if not supplied."""
+    value = message.get("time", message.get("timestamp"))
 
     if value is None:
         return None
@@ -74,6 +69,52 @@ def _decimal(value: Any, field: str) -> Decimal:
     return result
 
 
+def _normalise_changes(message: dict[str, Any]) -> list[tuple[str, Any, Any]]:
+    """Support both legacy Exchange and Advanced Trade update formats."""
+    if "changes" in message:
+        changes = message["changes"]
+
+        if not isinstance(changes, list):
+            raise CoinbaseWebSocketError("Changes must be a list")
+
+        return [tuple(change) for change in changes]
+
+    updates = message.get("updates")
+
+    if not isinstance(updates, list):
+        raise CoinbaseWebSocketError("Updates must be a list")
+
+    changes = []
+
+    for update in updates:
+        if not isinstance(update, dict):
+            raise CoinbaseWebSocketError(
+                f"Invalid order-book update: {update!r}"
+            )
+
+        side = update.get("side")
+
+        side_mapping = {
+            "bid": "buy",
+            "buy": "buy",
+            "offer": "sell",
+            "ask": "sell",
+            "sell": "sell",
+        }
+
+        if side not in side_mapping:
+            raise CoinbaseWebSocketError(
+                f"Unknown order-book side: {side!r}"
+            )
+
+        price = update.get("price_level", update.get("price"))
+        size = update.get("new_quantity", update.get("size"))
+
+        changes.append((side_mapping[side], price, size))
+
+    return changes
+
+
 class CoinbaseLevel2Book:
     """Maintain a local Coinbase Level 2 price-level book."""
 
@@ -91,11 +132,9 @@ class CoinbaseLevel2Book:
         self.initialized = False
 
     def apply_snapshot(self, message: dict[str, Any]) -> None:
-        """Initialize the book from a Level 2 snapshot."""
+        """Initialize the book from a snapshot."""
         if message.get("type") != "snapshot":
-            raise CoinbaseWebSocketError(
-                "Expected a snapshot message"
-            )
+            raise CoinbaseWebSocketError("Expected a snapshot message")
 
         if message.get("product_id") != self.product_id:
             raise CoinbaseWebSocketError(
@@ -105,37 +144,50 @@ class CoinbaseLevel2Book:
         bids: dict[Decimal, Decimal] = {}
         asks: dict[Decimal, Decimal] = {}
 
-        for side_name, target in (
-            ("bids", bids),
-            ("asks", asks),
-        ):
-            levels = message.get(side_name)
+        # Advanced Trade represents snapshots using an updates array.
+        if "updates" in message:
+            changes = _normalise_changes(message)
 
-            if not isinstance(levels, list):
-                raise CoinbaseWebSocketError(
-                    f"Snapshot {side_name} must be a list"
-                )
-
-            for level in levels:
-                if not isinstance(level, (list, tuple)) or len(level) != 2:
-                    raise CoinbaseWebSocketError(
-                        f"Invalid snapshot level: {level!r}"
-                    )
-
-                price = _decimal(level[0], "price")
-                size = _decimal(level[1], "size")
+            for side, raw_price, raw_size in changes:
+                price = _decimal(raw_price, "price")
+                size = _decimal(raw_size, "size")
 
                 if price <= 0 or size <= 0:
                     raise CoinbaseWebSocketError(
                         "Snapshot prices and sizes must be positive"
                     )
 
+                target = bids if side == "buy" else asks
                 target[price] = size
 
-        if not bids or not asks:
-            raise CoinbaseWebSocketError(
-                "Snapshot must contain bids and asks"
-            )
+        # Also support the legacy Exchange snapshot structure.
+        else:
+            for side_name, target in (
+                ("bids", bids),
+                ("asks", asks),
+            ):
+                levels = message.get(side_name)
+
+                if not isinstance(levels, list):
+                    raise CoinbaseWebSocketError(
+                        f"Snapshot {side_name} must be a list"
+                    )
+
+                for level in levels:
+                    if not isinstance(level, (list, tuple)) or len(level) != 2:
+                        raise CoinbaseWebSocketError(
+                            f"Invalid snapshot level: {level!r}"
+                        )
+
+                    price = _decimal(level[0], "price")
+                    size = _decimal(level[1], "size")
+
+                    if price <= 0 or size <= 0:
+                        raise CoinbaseWebSocketError(
+                            "Snapshot prices and sizes must be positive"
+                        )
+
+                    target[price] = size
 
         self._validate_book(bids, asks)
 
@@ -144,36 +196,34 @@ class CoinbaseLevel2Book:
         self.initialized = True
 
     def apply_update(self, message: dict[str, Any]) -> None:
-        """Apply absolute-size Level 2 updates to the local book."""
+        """Apply absolute-size updates to the local order book."""
         if not self.initialized:
             raise CoinbaseWebSocketError(
                 "Cannot apply update before snapshot"
             )
 
         if message.get("type") != "l2update":
-            raise CoinbaseWebSocketError(
-                "Expected an l2update message"
-            )
+            raise CoinbaseWebSocketError("Expected an l2update message")
 
         if message.get("product_id") != self.product_id:
             raise CoinbaseWebSocketError(
                 "Update product does not match configured product"
             )
 
-        changes = message.get("changes")
+        changes = _normalise_changes(message)
 
-        if not isinstance(changes, list) or not changes:
+        if not changes:
             raise CoinbaseWebSocketError(
-                "Update must contain a non-empty changes list"
+                "Update must contain at least one change"
             )
 
-        # Work on copies so an invalid message cannot partially mutate
-        # the previously accepted order book.
+        # Apply changes to copies first. Invalid updates must not
+        # partially mutate the accepted order book.
         bids = self.bids.copy()
         asks = self.asks.copy()
 
         for change in changes:
-            if not isinstance(change, (list, tuple)) or len(change) != 3:
+            if len(change) != 3:
                 raise CoinbaseWebSocketError(
                     f"Invalid order-book change: {change!r}"
                 )
@@ -202,6 +252,7 @@ class CoinbaseLevel2Book:
                     f"Unknown order-book side: {side!r}"
                 )
 
+            # Coinbase sends the new absolute size, not a size delta.
             if size == 0:
                 target.pop(price, None)
             else:
@@ -223,10 +274,7 @@ class CoinbaseLevel2Book:
                 "Order book must contain both bids and asks"
             )
 
-        best_bid = max(bids)
-        best_ask = min(asks)
-
-        if best_bid >= best_ask:
+        if max(bids) >= min(asks):
             raise CoinbaseWebSocketError(
                 "Order book is crossed or locked"
             )
@@ -236,8 +284,9 @@ class CoinbaseLevel2Book:
         message_index: int,
         message_type: str,
         exchange_time: str | None,
+        exchange_sequence_num: int | None = None,
     ) -> dict[str, Any]:
-        """Return a CSV-friendly record of the current top of book."""
+        """Return a CSV-friendly record of the current book."""
         if not self.initialized:
             raise CoinbaseWebSocketError(
                 "Cannot record book before snapshot"
@@ -247,12 +296,12 @@ class CoinbaseLevel2Book:
             self.bids.items(),
             key=lambda item: item[0],
             reverse=True,
-        )[: self.depth]
+        )[:self.depth]
 
         sorted_asks = sorted(
             self.asks.items(),
             key=lambda item: item[0],
-        )[: self.depth]
+        )[:self.depth]
 
         record: dict[str, Any] = {
             "product_id": self.product_id,
@@ -262,6 +311,7 @@ class CoinbaseLevel2Book:
             "captured_at_utc": datetime.now(
                 timezone.utc
             ).isoformat(),
+            "exchange_sequence_num": exchange_sequence_num,
             "bid_levels_available": len(self.bids),
             "ask_levels_available": len(self.asks),
         }
@@ -292,7 +342,7 @@ def capture_coinbase_level2(
     duration: int = 30,
     output: str = "results/coinbase_ws_capture.csv",
 ) -> dict[str, Any]:
-    """Capture a bounded Coinbase Exchange Level 2 WebSocket session."""
+    """Capture a bounded Advanced Trade Level 2 WebSocket session."""
     if duration < 1:
         raise ValueError("duration must be at least 1 second")
 
@@ -300,13 +350,15 @@ def capture_coinbase_level2(
         raise ValueError("depth must be at least 1")
 
     book = CoinbaseLevel2Book(product_id, depth=depth)
-    records: list[dict[str, Any]] = []
 
+    records: list[dict[str, Any]] = []
     started = time.monotonic()
     deadline = started + duration
+
     message_index = 0
-    snapshot_received = False
     update_count = 0
+    snapshot_received = False
+    last_sequence_num: int | None = None
 
     connection = None
 
@@ -317,13 +369,19 @@ def capture_coinbase_level2(
             enable_multithread=True,
         )
 
-        subscription = {
+        # Advanced Trade public market-data subscription.
+        # No API key or JWT is required for this public channel.
+        connection.send(json.dumps({
             "type": "subscribe",
             "product_ids": [product_id],
-            "channels": ["level2"],
-        }
+            "channel": "level2",
+        }))
 
-        connection.send(json.dumps(subscription))
+        # Heartbeats help keep an otherwise quiet subscription alive.
+        connection.send(json.dumps({
+            "type": "subscribe",
+            "channel": "heartbeats",
+        }))
 
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
@@ -340,55 +398,114 @@ def capture_coinbase_level2(
                 )
 
             try:
-                message = json.loads(raw_message)
+                envelope = json.loads(raw_message)
             except json.JSONDecodeError:
                 raise CoinbaseWebSocketError(
                     "Received invalid JSON from Coinbase"
                 ) from None
 
-            if not isinstance(message, dict):
+            if not isinstance(envelope, dict):
                 continue
 
-            message_type = message.get("type")
+            channel = envelope.get("channel")
 
-            if message_type == "error":
+            if envelope.get("type") == "error" or channel == "error":
                 raise CoinbaseWebSocketError(
-                    f"Coinbase returned an error: {message}"
+                    f"Coinbase returned an error: {envelope}"
                 )
 
-            if message_type == "subscriptions":
+            # Subscription acknowledgements and heartbeat messages
+            # do not contain order-book snapshots or updates.
+            if channel in ("subscriptions", "heartbeats"):
                 continue
 
-            if message_type == "snapshot":
-                if snapshot_received:
-                    raise CoinbaseWebSocketError(
-                        "Received an unexpected second snapshot"
-                    )
-
-                book.apply_snapshot(message)
-                snapshot_received = True
-
-            elif message_type == "l2update":
-                if not snapshot_received:
-                    raise CoinbaseWebSocketError(
-                        "Received update before snapshot"
-                    )
-
-                book.apply_update(message)
-                update_count += 1
-
-            else:
+            if channel != "l2_data":
                 continue
 
-            message_index += 1
+            events = envelope.get("events")
 
-            records.append(
-                book.to_record(
-                    message_index=message_index,
-                    message_type=message_type,
-                    exchange_time=_exchange_time(message),
+            if not isinstance(events, list):
+                raise CoinbaseWebSocketError(
+                    "Level 2 message has no valid events list"
                 )
-            )
+
+            exchange_timestamp = _exchange_time(envelope)
+            sequence_num = envelope.get("sequence_num")
+
+            if sequence_num is not None:
+                try:
+                    sequence_num = int(sequence_num)
+                except (TypeError, ValueError):
+                    raise CoinbaseWebSocketError(
+                        f"Invalid exchange sequence number: {sequence_num!r}"
+                    ) from None
+
+                if (
+                    last_sequence_num is not None
+                    and sequence_num <= last_sequence_num
+                ):
+                    raise CoinbaseWebSocketError(
+                        "Non-increasing exchange sequence number"
+                    )
+
+                last_sequence_num = sequence_num
+
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+
+                event_product = event.get("product_id")
+
+                if event_product != product_id:
+                    continue
+
+                event_type = event.get("type")
+
+                # Convert Advanced Trade events into the common
+                # internal representation used by the order book.
+                if event_type == "snapshot":
+                    if snapshot_received:
+                        raise CoinbaseWebSocketError(
+                            "Received an unexpected second snapshot"
+                        )
+
+                    internal_message = {
+                        "type": "snapshot",
+                        "product_id": product_id,
+                        "updates": event.get("updates", []),
+                    }
+
+                    book.apply_snapshot(internal_message)
+                    snapshot_received = True
+
+                elif event_type == "update":
+                    if not snapshot_received:
+                        raise CoinbaseWebSocketError(
+                            "Received update before snapshot"
+                        )
+
+                    internal_message = {
+                        "type": "l2update",
+                        "product_id": product_id,
+                        "updates": event.get("updates", []),
+                    }
+
+                    book.apply_update(internal_message)
+                    update_count += 1
+
+                else:
+                    continue
+
+                message_index += 1
+
+                records.append(
+                    book.to_record(
+                        message_index=message_index,
+                        message_type=event_type,
+                        exchange_time=exchange_timestamp,
+                        exchange_sequence_num=sequence_num,
+                    )
+                )
 
     finally:
         if connection is not None:
@@ -410,11 +527,11 @@ def capture_coinbase_level2(
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    dataframe = pd.DataFrame(records)
-    dataframe.to_csv(output_path, index=False)
+    pd.DataFrame(records).to_csv(output_path, index=False)
 
     metadata = {
-        "exchange": "Coinbase Exchange",
+        "exchange": "Coinbase Advanced Trade",
+        "endpoint": COINBASE_WS_URL,
         "channel": "level2",
         "product_id": product_id,
         "depth": depth,
@@ -426,12 +543,14 @@ def capture_coinbase_level2(
         "snapshot_received": snapshot_received,
         "incremental_updates_received": update_count,
         "records_written": len(records),
-        "message_index_note": (
-            "Local arrival-order counter; not an exchange sequence number."
+        "last_exchange_sequence_num": last_sequence_num,
+        "sequence_note": (
+            "Coinbase Advanced Trade envelope sequence_num; "
+            "not a substitute for independent packet-recovery validation."
         ),
-        "exchange_time_note": (
-            "Timestamp supplied by the exchange when present. "
-            "Missing snapshot timestamps are recorded as null."
+        "timestamp_note": (
+            "Exchange timestamp from the WebSocket envelope. "
+            "Missing timestamps are recorded as null."
         ),
         "output_csv": str(output_path),
     }
@@ -447,13 +566,15 @@ def capture_coinbase_level2(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Capture Coinbase Exchange Level 2 WebSocket data."
+        description=(
+            "Capture Coinbase Advanced Trade Level 2 market data."
+        )
     )
 
     parser.add_argument(
         "--product",
         default="BTC-USD",
-        help="Coinbase product ID, for example BTC-USD",
+        help="Product ID, for example BTC-USD",
     )
     parser.add_argument(
         "--depth",
