@@ -8,16 +8,20 @@ from leakguard.reconstruction import (
 )
 
 
+
 @pytest.fixture
 def initial_snapshot():
     return pd.DataFrame([
         {"side": "bid", "price": 99.0, "size": 10},
         {"side": "bid", "price": 98.0, "size": 20},
         {"side": "bid", "price": 97.0, "size": 30},
+        {"side": "bid", "price": 96.0, "size": 40},
         {"side": "ask", "price": 101.0, "size": 11},
         {"side": "ask", "price": 102.0, "size": 21},
         {"side": "ask", "price": 103.0, "size": 31},
+        {"side": "ask", "price": 104.0, "size": 41},
     ])
+
 
 
 @pytest.fixture
