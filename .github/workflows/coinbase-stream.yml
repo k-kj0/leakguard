@@ -1,0 +1,68 @@
+
+name: Capture Coinbase WebSocket Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: "Coinbase Exchange product ID"
+        required: true
+        default: "BTC-USD"
+        type: string
+      depth:
+        description: "Book levels per side"
+        required: true
+        default: "10"
+        type: string
+      duration:
+        description: "Capture duration in seconds"
+        required: true
+        default: "30"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  capture-level2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Capture Coinbase Level 2 stream
+        env:
+          PRODUCT_ID: ${{ inputs.product }}
+          BOOK_DEPTH: ${{ inputs.depth }}
+          CAPTURE_DURATION: ${{ inputs.duration }}
+        run: |
+          python -m leakguard.coinbase_ws \
+            --product "$PRODUCT_ID" \
+            --depth "$BOOK_DEPTH" \
+            --duration "$CAPTURE_DURATION" \
+            --out results/coinbase_ws_capture.csv
+
+      - name: Display capture metadata
+        run: |
+          cat results/coinbase_ws_capture.json
+          cat results/coinbase_ws_capture.json >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload captured order book
+        uses: actions/upload-artifact@v4
+        with:
+          name: coinbase-level2-websocket-capture
+          path: |
+            results/coinbase_ws_capture.csv
+            results/coinbase_ws_capture.json
+          if-no-files-found: error
