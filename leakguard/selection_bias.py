@@ -1,5 +1,13 @@
 
-"""Simulate the winner's curse from selecting the best random candidate."""
+"""Null-model experiment demonstrating selection bias.
+
+Every candidate model is evaluated on random scores unrelated to
+random binary labels. Selecting the best result from many trials
+can produce an apparently impressive AUC by chance alone.
+
+This is a controlled statistical demonstration, not a trading
+strategy or an estimate of real-world model performance.
+"""
 
 import argparse
 import json
@@ -9,120 +17,159 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 
-def run_selection_bias(
-    n_observations=1000,
-    n_trials=50,
-    repetitions=200,
-    seed=7,
-    selection_threshold=0.60,
-    out_dir="results/selection_bias",
-):
-    """
-    Compare one random candidate with the best of many random candidates.
+def _validate_parameters(n_observations, n_trials, repetitions):
+    if n_observations < 4:
+        raise ValueError("n_observations must be at least 4.")
 
-    Every candidate score is independent of the binary labels. Selecting
-    the maximum AUC on the same evaluation sample illustrates selection
-    optimism under a null with no predictive signal.
-    """
-    if n_observations < 100:
-        raise ValueError("Use at least 100 observations.")
+    if n_trials < 1:
+        raise ValueError("n_trials must be at least 1.")
 
-    if n_trials < 2:
-        raise ValueError("Use at least 2 candidate trials.")
+    if repetitions < 1:
+        raise ValueError("repetitions must be at least 1.")
 
-    if repetitions < 20:
-        raise ValueError("Use at least 20 repetitions.")
 
-    if not 0.5 < selection_threshold < 1.0:
-        raise ValueError(
-            "selection_threshold must be between 0.5 and 1.0."
+def _run_single_repetition(rng, n_observations, n_trials):
+    """Evaluate independent random predictors and retain the best AUC."""
+    labels = np.zeros(n_observations, dtype=int)
+
+    labels[: n_observations // 2] = 1
+    rng.shuffle(labels)
+
+    trial_aucs = []
+
+    for _ in range(n_trials):
+        random_scores = rng.standard_normal(n_observations)
+
+        auc = float(
+            roc_auc_score(labels, random_scores)
         )
 
+        trial_aucs.append(auc)
+
+    selected_auc = max(trial_aucs)
+
+    return {
+        "trial_count": n_trials,
+        "selected_auc": float(selected_auc),
+        "mean_trial_auc": float(np.mean(trial_aucs)),
+        "best_trial_auc": float(selected_auc),
+        "worst_trial_auc": float(min(trial_aucs)),
+    }
+
+
+def render_report(report):
+    """Render the experiment results as Markdown."""
+    summary = report["summary"]
+
+    lines = [
+        "# Leakguard Selection-Bias Experiment",
+        "",
+        "## Experiment configuration",
+        "",
+        f"- Observations per repetition: {report['n_observations']}",
+        f"- Independent random trials: {report['n_trials']}",
+        f"- Repetitions: {report['repetition_count']}",
+        f"- Random seed: {report['seed']}",
+        "",
+        "## Results",
+        "",
+        f"- Null reference AUC: **{summary['null_reference_auc']:.4f}**",
+        f"- Mean selected AUC: **{summary['mean_selected_auc']:.4f}**",
+        f"- Median selected AUC: **{summary['median_selected_auc']:.4f}**",
+        f"- 95th percentile selected AUC: **{summary['p95_selected_auc']:.4f}**",
+        f"- Mean unselected trial AUC: **{summary['mean_trial_auc']:.4f}**",
+        f"- Mean selection uplift: **{summary['selection_uplift']:.4f}**",
+        "",
+        "## Interpretation",
+        "",
+        "Every candidate score in this experiment is independent of the "
+        "binary outcome labels. There is no genuine predictive signal.",
+        "",
+        "Selecting the highest AUC from many random trials can nevertheless "
+        "produce an apparently strong result. Repeating the experiment "
+        "shows how this selection effect behaves under the specified "
+        "simulation settings.",
+        "",
+        "This experiment does not estimate the performance of a real "
+        "market model. It does not reproduce every form of financial "
+        "multiple testing, dependence, or non-stationarity.",
+        "",
+    ]
+
+    return "\n".join(lines)
+
+
+def run_selection_bias(
+    n_observations=300,
+    n_trials=20,
+    repetitions=30,
+    seed=7,
+    out_dir="results/selection_bias",
+):
+    """Run repeated null experiments and report the selection effect."""
+    _validate_parameters(
+        n_observations,
+        n_trials,
+        repetitions,
+    )
+
     rng = np.random.default_rng(seed)
+
     results = []
 
     for repetition in range(repetitions):
-        labels = rng.integers(
-            0,
-            2,
-            size=n_observations,
+        result = _run_single_repetition(
+            rng,
+            n_observations,
+            n_trials,
         )
 
-        candidate_aucs = []
+        result["repetition"] = repetition + 1
+        results.append(result)
 
-        for _ in range(n_trials):
-            random_scores = rng.normal(
-                loc=0.0,
-                scale=1.0,
-                size=n_observations,
-            )
-
-            candidate_aucs.append(
-                float(roc_auc_score(labels, random_scores))
-            )
-
-        single_auc = candidate_aucs[0]
-        selected_auc = max(candidate_aucs)
-
-        results.append({
-            "repetition": repetition + 1,
-            "single_candidate_auc": single_auc,
-            "best_candidate_auc": selected_auc,
-        })
-
-    single_values = np.asarray(
-        [item["single_candidate_auc"] for item in results],
+    selected_aucs = np.array(
+        [item["selected_auc"] for item in results],
         dtype=float,
     )
 
-    selected_values = np.asarray(
-        [item["best_candidate_auc"] for item in results],
+    mean_trial_aucs = np.array(
+        [item["mean_trial_auc"] for item in results],
         dtype=float,
     )
+
+    null_reference_auc = 0.5
+    mean_selected_auc = float(np.mean(selected_aucs))
 
     summary = {
-        "repetitions": repetitions,
-        "candidate_trials_per_repetition": n_trials,
-        "mean_single_candidate_auc": float(np.mean(single_values)),
-        "mean_selected_candidate_auc": float(
-            np.mean(selected_values)
+        "null_reference_auc": null_reference_auc,
+        "mean_selected_auc": mean_selected_auc,
+        "median_selected_auc": float(np.median(selected_aucs)),
+        "p95_selected_auc": float(
+            np.percentile(selected_aucs, 95)
         ),
-        "mean_selection_uplift": float(
-            np.mean(selected_values - single_values)
+        "mean_trial_auc": float(np.mean(mean_trial_aucs)),
+        "selection_uplift": float(
+            mean_selected_auc - null_reference_auc
         ),
-        "median_selected_candidate_auc": float(
-            np.median(selected_values)
+        "repetitions_above_null": int(
+            np.sum(selected_aucs > null_reference_auc)
         ),
-        "selected_auc_95th_percentile": float(
-            np.quantile(selected_values, 0.95)
-        ),
-        "fraction_selected_auc_at_least_threshold": float(
-            np.mean(selected_values >= selection_threshold)
-        ),
-        "selection_threshold": selection_threshold,
-        "null_reference_auc": 0.5,
     }
 
     report = {
-        "experiment": "Random-candidate selection bias simulation",
-        "seed": seed,
-        "observations_per_repetition": n_observations,
-        "candidate_trials_per_repetition": n_trials,
-        "selection_rule": "choose the candidate with the highest AUC",
-        "evaluation_reuse": (
-            "The same labels are used to score all candidates and select "
-            "the winner, illustrating selection on the evaluation sample."
-        ),
-        "summary": summary,
+        "experiment": "random_predictor_selection_bias",
+        "version": 1,
+        "seed": int(seed),
+        "n_observations": int(n_observations),
+        "n_trials": int(n_trials),
+        "repetition_count": int(repetitions),
         "repetitions": results,
-        "limitations": [
-            "All candidate scores are random and independent of the labels.",
-            "This is a controlled null simulation, not a model benchmark.",
-            "The selected candidate is evaluated on the same sample used for selection.",
-            "The experiment illustrates selection optimism, not a correction for it.",
-            "The results depend on observation count, candidate count and threshold.",
-            "This does not estimate the number of trials in any real research project.",
-        ],
+        "summary": summary,
+        "interpretation": (
+            "Controlled null simulation. Random predictors have no "
+            "relationship with the labels. Selecting the best result "
+            "among multiple trials demonstrates selection bias."
+        ),
     }
 
     output = Path(out_dir)
@@ -133,71 +180,34 @@ def run_selection_bias(
         encoding="utf-8",
     )
 
-    lines = [
-        "# Leakguard Selection-Bias Simulation",
-        "",
-        f"- Seed: **{seed}**",
-        f"- Observations per repetition: **{n_observations}**",
-        f"- Random candidate trials per repetition: **{n_trials}**",
-        f"- Repetitions: **{repetitions}**",
-        "- Candidate selection: **highest AUC on the same evaluation sample**",
-        "",
-        "## Results",
-        "",
-        "| Metric | Result |",
-        "|---|---:|",
-        f"| Mean AUC of first random candidate | {summary['mean_single_candidate_auc']:.4f} |",
-        f"| Mean AUC of selected best candidate | {summary['mean_selected_candidate_auc']:.4f} |",
-        f"| Mean selection uplift | {summary['mean_selection_uplift']:.4f} |",
-        f"| Median selected AUC | {summary['median_selected_candidate_auc']:.4f} |",
-        f"| 95th percentile selected AUC | {summary['selected_auc_95th_percentile']:.4f} |",
-        f"| Fraction selected AUC >= {selection_threshold:.2f} | "
-        f"{summary['fraction_selected_auc_at_least_threshold']:.1%} |",
-        "",
-        "The candidates contain no predictive signal. A selected score can "
-        "look better simply because the best of many noisy results was chosen.",
-        "",
-        "## Interpretation",
-        "",
-        "- The first random candidate is a reference for a single unselected trial.",
-        "- The selected candidate is the maximum across all candidate trials.",
-        "- The difference illustrates the winner's curse from repeated evaluation.",
-        "- A separate untouched test set or a properly designed nested evaluation "
-        "is needed to assess a selected research candidate.",
-        "",
-        "## Limitations",
-        "",
-    ]
-
-    lines.extend(f"- {item}" for item in report["limitations"])
-
-    markdown = "\n".join(lines) + "\n"
-
     (output / "latest.md").write_text(
-        markdown,
+        render_report(report),
         encoding="utf-8",
     )
 
-    print(markdown)
+    print(render_report(report))
+
     return report
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--observations", type=int, default=1000)
-    parser.add_argument("--trials", type=int, default=50)
-    parser.add_argument("--repetitions", type=int, default=200)
+
+    parser.add_argument("--n-observations", type=int, default=300)
+    parser.add_argument("--n-trials", type=int, default=20)
+    parser.add_argument("--repetitions", type=int, default=30)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--threshold", type=float, default=0.60)
-    parser.add_argument("--out", default="results/selection_bias")
+    parser.add_argument(
+        "--out",
+        default="results/selection_bias",
+    )
 
     args = parser.parse_args()
 
     run_selection_bias(
-        n_observations=args.observations,
-        n_trials=args.trials,
+        n_observations=args.n_observations,
+        n_trials=args.n_trials,
         repetitions=args.repetitions,
         seed=args.seed,
-        selection_threshold=args.threshold,
         out_dir=args.out,
     )
