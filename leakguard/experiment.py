@@ -1,4 +1,3 @@
-
 """Run reproducible order-book research validation and write reports."""
 
 import argparse
@@ -12,12 +11,17 @@ import pandas as pd
 import sklearn
 
 from .checks import check_causality, check_data_integrity
-from .cv import purged_walk_forward, label_overlap_fraction
+from .cv import (
+    label_overlap_fraction,
+    naive_kfold,
+    purged_walk_forward,
+)
 from .data import load_order_book_csv
 from .features import (
     build_dataset,
     build_features,
     build_features_leaky,
+    label_tie_fraction,
 )
 from .metrics import (
     classification_metrics,
@@ -83,6 +87,46 @@ def _stability_summary(fold_metrics):
             "min": float(np.min(values)),
             "max": float(np.max(values)),
             "valid_folds": len(values),
+        }
+
+    return output
+
+
+def _naive_vs_purged(X, y, factories, purged_auc, n_splits, seed):
+    """Same models, same data: shuffled K-fold AUC versus purged AUC."""
+    splits = naive_kfold(len(X), n_splits, seed)
+    output = {}
+
+    for name, factory in factories.items():
+        aucs = []
+
+        for train_idx, test_idx in splits:
+            model = factory()
+            model.fit(X.iloc[train_idx], y.iloc[train_idx])
+
+            probabilities = model.predict_proba(
+                X.iloc[test_idx]
+            )[:, 1]
+
+            auc = classification_metrics(
+                y.iloc[test_idx].to_numpy(),
+                probabilities,
+            )["auc"]
+
+            if auc is not None:
+                aucs.append(auc)
+
+        naive_auc = float(np.mean(aucs)) if aucs else None
+        purged = purged_auc.get(name)
+
+        output[name] = {
+            "naive_auc": naive_auc,
+            "purged_auc": purged,
+            "inflation": (
+                naive_auc - purged
+                if naive_auc is not None and purged is not None
+                else None
+            ),
         }
 
     return output
@@ -268,12 +312,52 @@ def render_report(report):
     lines = [
         "# Leakguard research report",
         "",
+        "## Headline: naive K-fold vs purged walk-forward",
+        "",
+        "Same data, same models. Only the validation method differs.",
+        "",
+        "| Model | Naive K-fold AUC | Purged walk-forward AUC | Inflation |",
+        "|---|---:|---:|---:|",
+    ]
+
+    for name, row in report["naive_vs_purged"].items():
+        if row["naive_auc"] is None or row["purged_auc"] is None:
+            lines.append(f"| {name} | n/a | n/a | n/a |")
+            continue
+
+        lines.append(
+            f"| {name} | {row['naive_auc']:.3f} | "
+            f"{row['purged_auc']:.3f} | "
+            f"{row['inflation']:+.3f} |"
+        )
+
+    lines += [
+        "",
+        "Naive K-fold shuffles rows, so training rows sit next to test "
+        "rows and share overlapping label windows. Any gap above comes "
+        "from the validation method, not from skill. Only the purged "
+        "column is an honest estimate.",
+        "",
         f"- Data source: **{report['data_source']}**",
         (
             f"- Rows: **{report['input_rows']}** "
             f"(usable: {report['rows_used']})"
         ),
-        f"- Horizon: **{report['horizon']} observations**",
+        (
+            f"- Horizon: **{report['horizon_ms']} ms** "
+            f"(purged over up to {report['purge_rows']} rows)"
+            if report["horizon_ms"]
+            else f"- Horizon: **{report['horizon']} observations**"
+        ),
+        (
+            f"- Rows where mid-price did not move over the horizon: "
+            f"**{report['tie_fraction']:.1%}** "
+            + (
+                "(dropped, so the label means up vs down)"
+                if report["ties_dropped"]
+                else "(kept and labelled 0)"
+            )
+        ),
         f"- SHA-256 data fingerprint: `{report['data_hash']}`",
         (
             f"- Integrity issues: "
@@ -296,8 +380,8 @@ def render_report(report):
         "",
         "## Out-of-sample model results",
         "",
-        "| Model | AUC | Accuracy | Balanced accuracy | Brier |",
-        "|---|---:|---:|---:|---:|",
+        "| Model | AUC | Accuracy | Balanced accuracy | Brier | Calibration error |",
+        "|---|---:|---:|---:|---:|---:|",
     ]
 
     for name, model in report["models"].items():
@@ -311,10 +395,16 @@ def render_report(report):
             f"| {name} | {auc} | "
             f"{model['accuracy']:.4f} | "
             f"{model['balanced_accuracy']:.4f} | "
-            f"{model['brier']:.4f} |"
+            f"{model['brier']:.4f} | "
+            f"{model['ece']:.4f} |"
         )
 
     lines += [
+        "",
+        "A constant 50/50 forecast scores Brier 0.25. A Brier above 0.25 "
+        "means the probabilities are worse than no model at all, even if "
+        "AUC looks fine. Calibration error is the average gap between "
+        "predicted probability and observed frequency.",
         "",
         "## Confidence intervals",
         "",
@@ -434,7 +524,11 @@ def render_report(report):
         "- Fold stability is descriptive; it does not guarantee future performance.",
         "- A CSV input is only as trustworthy as its source, timestamp semantics "
         "and normalization.",
-        "- The cost diagnostic is not a realistic execution simulator.",
+        "- The cost diagnostic is not a realistic execution simulator. "
+        "Positions are non-overlapping, one every horizon.",
+        "- The naive-vs-purged comparison uses a different train/test shape "
+        "(random 80/20 versus expanding window), so the gap is indicative, "
+        "not a precise measurement of leakage.",
         "- This report does not establish profitability or readiness for live trading.",
         "",
         "## Reproducibility",
@@ -458,6 +552,8 @@ def run(
     embargo=None,
     fee_bps=0.0,
     slippage_bps=0.0,
+    horizon_ms=None,
+    drop_ties=True,
 ):
     """Run data checks, validation, reliability analysis and reporting."""
     if data_path:
@@ -474,9 +570,6 @@ def run(
         ).values.tobytes()
     ).hexdigest()
 
-    if embargo is None:
-        embargo = horizon // 5
-
     integrity = check_data_integrity(df)
 
     causal = check_causality(build_features, df)
@@ -486,7 +579,21 @@ def run(
         df,
         horizon,
         return_meta=True,
+        ties="drop" if drop_ties else "as_down",
+        horizon_ms=horizon_ms,
     )
+
+    tie_fraction = label_tie_fraction(df, horizon, horizon_ms)
+
+    # Purging must cover the longest label window, counted in rows.
+    purge_rows = (
+        horizon
+        if horizon_ms is None
+        else int(meta["hold_rows"].max())
+    )
+
+    if embargo is None:
+        embargo = purge_rows // 5
 
     if "volatility_20" not in X.columns:
         raise ValueError(
@@ -495,7 +602,7 @@ def run(
 
     splits = purged_walk_forward(
         len(X),
-        horizon,
+        purge_rows,
         n_splits,
         initial_train_frac,
         embargo,
@@ -511,7 +618,7 @@ def run(
         label_overlap_fraction(
             train_idx,
             test_idx,
-            horizon,
+            purge_rows,
             len(X),
         )
         for train_idx, test_idx in splits
@@ -525,7 +632,16 @@ def run(
         model_factories(),
         fee_bps,
         slippage_bps,
-        horizon,
+        purge_rows,
+        seed,
+    )
+
+    naive_vs_purged = _naive_vs_purged(
+        X,
+        y,
+        model_factories(),
+        {name: result["auc"] for name, result in models.items()},
+        n_splits,
         seed,
     )
 
@@ -534,6 +650,11 @@ def run(
         "input_rows": len(df),
         "rows_used": len(X),
         "horizon": horizon,
+        "horizon_ms": horizon_ms,
+        "purge_rows": purge_rows,
+        "tie_fraction": tie_fraction,
+        "ties_dropped": drop_ties,
+        "naive_vs_purged": naive_vs_purged,
         "data_hash": digest,
         "integrity_issues": integrity,
         "causality_clean": causal,
@@ -544,6 +665,8 @@ def run(
         "params": {
             "n": n,
             "horizon": horizon,
+            "horizon_ms": horizon_ms,
+            "drop_ties": drop_ties,
             "seed": seed,
             "n_splits": n_splits,
             "initial_train_frac": initial_train_frac,
@@ -597,6 +720,16 @@ if __name__ == "__main__":
     parser.add_argument("--embargo", type=int)
     parser.add_argument("--fee-bps", type=float, default=0.0)
     parser.add_argument("--slippage-bps", type=float, default=0.0)
+    parser.add_argument(
+        "--horizon-ms",
+        type=int,
+        help="Predict over this many milliseconds instead of --horizon rows",
+    )
+    parser.add_argument(
+        "--keep-ties",
+        action="store_true",
+        help="Keep rows with no price move and label them 0 (old behaviour)",
+    )
 
     args = parser.parse_args()
 
@@ -610,4 +743,6 @@ if __name__ == "__main__":
         embargo=args.embargo,
         fee_bps=args.fee_bps,
         slippage_bps=args.slippage_bps,
+        horizon_ms=args.horizon_ms,
+        drop_ties=not args.keep_ties,
     )
