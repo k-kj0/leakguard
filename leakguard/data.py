@@ -1,8 +1,8 @@
 """Load and validate normalized order-book CSV data."""
 
 from pathlib import Path
-import pandas as pd
 
+import pandas as pd
 
 REQUIRED = [
     "ts_ms",

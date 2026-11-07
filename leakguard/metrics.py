@@ -1,12 +1,11 @@
 """Out-of-sample metrics and simplified cost diagnostics."""
 
 import numpy as np
-
 from sklearn.metrics import (
-    roc_auc_score,
     accuracy_score,
     balanced_accuracy_score,
     brier_score_loss,
+    roc_auc_score,
 )
 
 

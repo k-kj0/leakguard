@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-
 BASE_COLUMNS = [
     "bid_px_1",
     "ask_px_1",

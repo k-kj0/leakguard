@@ -9,14 +9,13 @@ from __future__ import annotations
 import argparse
 import json
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import websocket
-
 
 COINBASE_WS_URL = "wss://advanced-trade-ws.coinbase.com"
 
@@ -309,7 +308,7 @@ class CoinbaseLevel2Book:
             "message_type": message_type,
             "exchange_time": exchange_time,
             "captured_at_utc": datetime.now(
-                timezone.utc
+                UTC
             ).isoformat(),
             "exchange_sequence_num": exchange_sequence_num,
             "bid_levels_available": len(self.bids),

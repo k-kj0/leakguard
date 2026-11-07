@@ -8,7 +8,6 @@ from leakguard.reconstruction import (
 )
 
 
-
 @pytest.fixture
 def initial_snapshot():
     return pd.DataFrame([

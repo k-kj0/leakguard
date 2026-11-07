@@ -1,26 +1,20 @@
-import numpy as np
-import pandas as pd
 import pytest
-
-from leakguard.simulate import simulate_order_book
-
-from leakguard.features import (
-    build_dataset,
-    build_features,
-    build_features_leaky,
-)
 
 from leakguard.checks import (
     check_causality,
     check_data_integrity,
 )
-
 from leakguard.cv import (
-    purged_walk_forward,
     label_overlap_fraction,
+    purged_walk_forward,
 )
-
 from leakguard.data import load_order_book_csv
+from leakguard.features import (
+    build_dataset,
+    build_features,
+    build_features_leaky,
+)
+from leakguard.simulate import simulate_order_book
 
 
 @pytest.fixture(scope="module")

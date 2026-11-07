@@ -12,15 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import pandas as pd
-
 
 COINBASE_EXCHANGE_BASE = "https://api.exchange.coinbase.com"
 
@@ -136,7 +134,7 @@ def parse_coinbase_l2_snapshot(payload, product_id, depth=10):
         "sequence": sequence,
         "depth_per_side": depth,
         "received_at_utc": datetime.now(
-            timezone.utc
+            UTC
         ).isoformat(),
     }
 

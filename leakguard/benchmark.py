@@ -16,7 +16,6 @@ import sklearn
 from .features import build_features
 from .simulate import simulate_order_book
 
-
 DEFAULT_ROW_COUNTS = (10_000, 30_000, 60_000)
 
 

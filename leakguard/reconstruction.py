@@ -14,7 +14,6 @@ from decimal import Decimal, InvalidOperation
 
 import pandas as pd
 
-
 SNAPSHOT_COLUMNS = {"side", "price", "size"}
 UPDATE_COLUMNS = {"sequence", "ts_ms", "side", "price", "size"}
 
