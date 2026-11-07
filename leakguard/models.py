@@ -24,10 +24,12 @@ def model_factories():
         "hist_gradient_boosting": lambda: make_pipeline(
             SimpleImputer(strategy="median"),
             HistGradientBoostingClassifier(
-                max_iter=100,
-                max_leaf_nodes=15,
-                learning_rate=0.06,
-                l2_regularization=1.0,
+                max_iter=40,
+                max_leaf_nodes=4,
+                learning_rate=0.03,
+                l2_regularization=10.0,
+                min_samples_leaf=800,
+                class_weight="balanced",
                 random_state=0,
             ),
         ),
