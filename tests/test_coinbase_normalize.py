@@ -8,9 +8,10 @@ from leakguard.coinbase_normalize import normalize_capture
 def make_capture():
     return pd.DataFrame({
         "product_id": ["BTC-USD"] * 4,
+        "message_index": [1, 2, 3, 4],
         "exchange_time": [
             "2026-01-01T00:00:00.000Z",
-            "2026-01-01T00:00:00.001Z",
+            "2026-01-01T00:00:00.000Z",
             "2026-01-01T00:00:00.002Z",
             "2026-01-01T00:00:00.003Z",
         ],
@@ -35,53 +36,119 @@ def make_capture():
     })
 
 
-def test_normalizes_coinbase_capture(tmp_path):
+def test_normalizes_capture_onto_fixed_time_grid(tmp_path):
     source = tmp_path / "capture.csv"
     output = tmp_path / "normalized.csv"
 
     make_capture().to_csv(source, index=False)
 
-    result = normalize_capture(source, output)
+    result = normalize_capture(
+        source,
+        output,
+        sample_ms=1,
+        max_staleness_ms=5,
+    )
 
     normalized = pd.read_csv(output)
 
     assert len(normalized) == 4
-    assert "ts_ms" in normalized.columns
+    assert normalized["ts_ms"].is_monotonic_increasing
+    assert normalized["ts_ms"].is_unique
     assert "bid_px_1" in normalized.columns
     assert "ask_px_1" in normalized.columns
-    assert result["timestamp_source"] == "exchange_time"
+    assert result["timestamp_source"] == "captured_at_utc"
+    assert result["sample_interval_ms"] == 1
     assert result["experiment_ready_by_row_count"] is False
     assert output.with_suffix(".json").is_file()
 
 
-def test_duplicate_timestamps_keep_last_book_state(tmp_path):
+def test_duplicate_exchange_times_do_not_delete_capture_states(tmp_path):
     source = tmp_path / "capture.csv"
     output = tmp_path / "normalized.csv"
 
     data = make_capture()
-    data.loc[1, "exchange_time"] = data.loc[0, "exchange_time"]
     data.to_csv(source, index=False)
 
-    result = normalize_capture(source, output)
+    result = normalize_capture(
+        source,
+        output,
+        sample_ms=1,
+        max_staleness_ms=5,
+    )
 
     normalized = pd.read_csv(output)
 
-    assert len(normalized) == 3
-    assert result["duplicate_timestamp_rows_removed"] == 1
-    assert normalized.iloc[0]["bid_px_1"] == 99.1
+    assert result["input_rows"] == 4
+    assert result["output_rows"] == 4
+    assert result["raw_duplicate_exchange_timestamps"] == 1
+    assert len(normalized) == 4
 
 
-def test_uses_receive_time_if_exchange_time_is_missing(tmp_path):
+def test_sampling_uses_only_previously_received_states(tmp_path):
     source = tmp_path / "capture.csv"
     output = tmp_path / "normalized.csv"
 
     data = make_capture()
-    data.loc[1, "exchange_time"] = None
+
+    # Remove the second and fourth source observations.
+    data = data.iloc[[0, 2, 3]].copy()
+    data["message_index"] = [1, 2, 3]
+
     data.to_csv(source, index=False)
 
-    result = normalize_capture(source, output)
+    normalize_capture(
+        source,
+        output,
+        sample_ms=1,
+        max_staleness_ms=5,
+    )
 
-    assert result["timestamp_source"] == "captured_at_utc"
+    normalized = pd.read_csv(output)
+
+    # At 11 ms, the 10 ms state is still the latest available state.
+    assert normalized.iloc[1]["bid_px_1"] == 99.0
+
+    # At 12 ms, the new state is available.
+    assert normalized.iloc[2]["bid_px_1"] == 99.2
+
+
+def test_rejects_stale_state_gap(tmp_path):
+    source = tmp_path / "capture.csv"
+    output = tmp_path / "normalized.csv"
+
+    data = make_capture().iloc[[0, 3]].copy()
+    data["message_index"] = [1, 2]
+    data.to_csv(source, index=False)
+
+    with pytest.raises(ValueError, match="stale-data gaps"):
+        normalize_capture(
+            source,
+            output,
+            sample_ms=1,
+            max_staleness_ms=1,
+        )
+
+
+def test_rejects_out_of_order_capture_times(tmp_path):
+    source = tmp_path / "capture.csv"
+    output = tmp_path / "normalized.csv"
+
+    data = make_capture()
+    data.loc[1, "captured_at_utc"] = (
+        data.loc[0, "captured_at_utc"]
+    )
+    data.loc[0, "captured_at_utc"] = (
+        "2026-01-01T00:00:00.012Z"
+    )
+
+    data.to_csv(source, index=False)
+
+    with pytest.raises(ValueError, match="out of order"):
+        normalize_capture(
+            source,
+            output,
+            sample_ms=1,
+        )
 
 
 def test_rejects_crossed_order_book(tmp_path):
@@ -93,7 +160,11 @@ def test_rejects_crossed_order_book(tmp_path):
     data.to_csv(source, index=False)
 
     with pytest.raises(ValueError, match="best bid"):
-        normalize_capture(source, output)
+        normalize_capture(
+            source,
+            output,
+            sample_ms=1,
+        )
 
 
 def test_rejects_multiple_products(tmp_path):
@@ -104,5 +175,25 @@ def test_rejects_multiple_products(tmp_path):
     data.loc[1, "product_id"] = "ETH-USD"
     data.to_csv(source, index=False)
 
-    with pytest.raises(ValueError, match="multiple products"):
-        normalize_capture(source, output)
+    with pytest.raises(ValueError, match="exactly one"):
+        normalize_capture(
+            source,
+            output,
+            sample_ms=1,
+        )
+
+
+def test_rejects_non_increasing_message_index(tmp_path):
+    source = tmp_path / "capture.csv"
+    output = tmp_path / "normalized.csv"
+
+    data = make_capture()
+    data.loc[2, "message_index"] = 1
+    data.to_csv(source, index=False)
+
+    with pytest.raises(ValueError, match="message_index"):
+        normalize_capture(
+            source,
+            output,
+            sample_ms=1,
+        )
