@@ -1,4 +1,3 @@
-
 name: Coinbase Real-Data Research Pipeline
 
 on:
@@ -10,19 +9,19 @@ on:
         default: "BTC-USD"
         type: string
       capture_seconds:
-        description: "Capture duration in seconds (300 = 5 minutes)"
+        description: "Capture duration in seconds (900 = 15 minutes)"
         required: true
-        default: "300"
+        default: "900"
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   real-data-research:
     name: Capture, audit and evaluate real market data
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
 
     env:
       PRODUCT_ID: ${{ inputs.product_id }}
@@ -65,17 +64,23 @@ jobs:
           python -m leakguard.data_quality \
             --input results/coinbase_normalized.csv \
             --out results/data_quality \
-            --expected-interval-ms 1000
+            --expected-interval-ms 100
 
       - name: Run research experiment on captured data
         run: |
           python -m leakguard.experiment \
             --data results/coinbase_normalized.csv \
-            --horizon 50 \
+            --horizon-ms 5000 \
             --splits 5 \
             --fee-bps 1 \
             --slippage-bps 1 \
             --out results/real_data_experiment
+
+      - name: Reproduce the order-flow-imbalance result on captured data
+        run: |
+          python -m leakguard.ofi_reproduction \
+            --data results/coinbase_normalized.csv \
+            --out results
 
       - name: Run Red-Team challenge suite
         run: |
@@ -93,6 +98,7 @@ jobs:
           for report in \
             results/data_quality/latest.md \
             results/real_data_experiment/latest.md \
+            results/ofi_reproduction.md \
             results/redteam/latest.md
           do
             if [ -f "$report" ]; then
@@ -105,6 +111,21 @@ jobs:
             echo "## Coinbase capture metadata" >> "$GITHUB_STEP_SUMMARY"
             cat results/coinbase_ws_capture.json >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Commit the real-data reports to the repository
+        run: |
+          DEST="reports/real_capture_run_${{ github.run_number }}"
+          mkdir -p "$DEST"
+          cp results/real_data_experiment/latest.md "$DEST/experiment.md"
+          cp results/real_data_experiment/latest.json "$DEST/experiment.json"
+          cp results/ofi_reproduction.md "$DEST/ofi_reproduction.md"
+          cp results/data_quality/latest.md "$DEST/data_quality.md"
+          cp results/coinbase_ws_capture.json "$DEST/capture_metadata.json" || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports
+          git commit -m "Add real-data report from run ${{ github.run_number }}"
+          git push
 
       - name: Upload complete research artifacts
         if: always()
