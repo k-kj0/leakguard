@@ -10,6 +10,34 @@ from sklearn.metrics import (
 )
 
 
+def expected_calibration_error(y_true, probabilities, bins=10):
+    """Average gap between predicted probability and actual frequency.
+
+    0 means perfectly calibrated. Predictions are grouped into equal-width
+    probability bins; each bin's gap is weighted by how many rows it holds.
+    """
+
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(probabilities, dtype=float)
+
+    if len(y) == 0:
+        return 0.0
+
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    which = np.clip(np.digitize(p, edges[1:-1]), 0, bins - 1)
+
+    total = 0.0
+
+    for b in range(bins):
+        mask = which == b
+
+        if mask.any():
+            gap = abs(p[mask].mean() - y[mask].mean())
+            total += gap * mask.sum()
+
+    return float(total / len(y))
+
+
 def classification_metrics(
     y_true,
     probabilities,
@@ -32,6 +60,8 @@ def classification_metrics(
         "brier": float(
             brier_score_loss(y, p)
         ),
+
+        "ece": expected_calibration_error(y, p),
     }
 
     out["auc"] = (
@@ -56,12 +86,24 @@ def directional_cost_diagnostic(
     Short when p <= 1 - threshold.
     Otherwise remain flat.
 
+    Each position is held for `hold_rows` rows. When meta has that column,
+    only every hold_rows-th row is traded, so positions never overlap and
+    the summed return is not counted several times over.
+
     Assumes immediate execution at mid +/- half-spread.
     Does not model queue position, partial fills, market impact,
     latency or adverse selection.
     """
 
     p = np.asarray(probabilities)
+
+    stride = 1
+
+    if "hold_rows" in meta.columns and len(meta):
+        stride = max(1, int(meta["hold_rows"].max()))
+
+    p = p[::stride]
+    meta = meta.iloc[::stride]
 
     direction = np.where(
         p >= threshold,
@@ -99,6 +141,10 @@ def directional_cost_diagnostic(
     return {
         "threshold": threshold,
 
+        "positions_evaluated": int(len(p)),
+
+        "non_overlap_stride_rows": int(stride),
+
         "active_fraction": float(
             active.mean()
         ),
@@ -116,6 +162,7 @@ def directional_cost_diagnostic(
         ),
 
         "note": (
-            "Diagnostic only; not a realistic execution/backtest model."
+            "Diagnostic only; not a realistic execution/backtest model. "
+            "Positions do not overlap."
         ),
     }
