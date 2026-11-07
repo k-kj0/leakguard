@@ -9,7 +9,7 @@ import numpy as np
 from sklearn.metrics import accuracy_score, roc_auc_score
 
 from .cv import purged_walk_forward
-from .data import simulate_order_book
+from .simulate import simulate_order_book
 from .features import build_dataset
 from .models import model_factories
 
