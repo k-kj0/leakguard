@@ -1,643 +1,204 @@
+# Leakguard: does your order-book model survive honest validation?
 
-# Leakguard — Order-Book ML Research Validation
+Leakguard tests whether a short-horizon order-book machine-learning result is real or an artifact of leakage. It audits the data, checks features for look-ahead, validates with purged walk-forward splits, and reports uncertainty and calibration.
 
-**A research-engineering toolkit for testing the reliability of short-horizon order-book machine-learning experiments.**
+## What it found
 
-Leakguard investigates a fundamental problem in quantitative research: a model's reported performance is not trustworthy if its market data is corrupted, its features contain future information, or its validation methodology leaks information across time.
+**1. Shuffled cross-validation inflates the score.** Same data, same models; only the validation method changes (synthetic data, 30,000 rows, 50-row horizon):
 
-It combines public market-data collection, order-book reconstruction, data-quality auditing, causal feature engineering, leakage diagnostics, purged chronological validation, statistical reliability checks, controlled Red-Team challenges, and reproducible reports.
+| Model | Naive K-fold AUC | Purged walk-forward AUC | Inflation |
+|---|---:|---:|---:|
+| Logistic regression | 0.617 | 0.577 | +0.040 |
+| Gradient boosting | 0.622 | 0.559 | +0.062 |
 
-**Status:** Independent research-engineering prototype.
+An earlier, over-fitted version of the gradient-boosting model showed a far bigger gap (AUC 0.725 naive vs 0.555 purged). A flexible model can memorise neighbouring rows, and shuffled splits reward that.
 
-**Important:** Leakguard is not a production HFT engine, exchange execution system, or proof of profitable trading alpha.
+**2. A good AUC can hide bad probabilities.** That over-fitted model scored a Brier of 0.280, worse than the 0.25 of a constant 50/50 forecast. Smaller trees, larger leaves and a stronger L2 penalty brought it to 0.2475. Every report now prints calibration error next to Brier.
 
----
+**3. Contemporaneous is not predictive.** The repo reproduces the method of Cont, Kukanov and Stoikov (2014), who found that order flow imbalance explains same-interval price changes well (average R² about 0.65). A forecaster needs it to predict the *next* interval. On synthetic data the code gives R² 0.68 for the same bin and 0.002 for the next bin. Synthetic prices are generated tick by tick, so this only checks the code. The real-data result is below.
 
-## 1. Research objective
+## Real-data result
 
-The central research question:
+> FILL IN after the real-data run. Link the folder (for example `reports/real_capture_run_1/`), and paste the headline table from `experiment.md` and the three rows from `ofi_reproduction.md`. Report the numbers as they came out, including "no edge".
 
-Can order-book imbalance and microstructure features predict short-horizon price movements out of sample after accounting for:
+## Quick start
 
-- Market-data integrity problems.
-- Future-information leakage.
-- Overlapping prediction labels.
-- Changes in volatility regimes.
-- Statistical uncertainty.
-- Multiple-experiment selection bias.
-- Simplified transaction-cost assumptions.
+Requires Python 3.11 or newer.
 
-The goal is not simply to train a model. It is to make the research process more auditable, reproducible, and difficult to fool.
+```bash
+python -m pip install -r requirements.txt
+python -m pytest -q
+python -m leakguard.experiment --n 30000 --horizon 50
+python -m leakguard.ofi_reproduction --n 30000
+```
 
-## 2. Architecture
+Reports are written to `results/` (ignored by git). Curated real-data reports are committed to `reports/`.
+
+## How it works
 
 ```text
-       Public / Synthetic Market Data
-                    |
-                    v
-             Data Collection
-                    |
-                    v
-          Snapshot + Update Handling
-                    |
-                    v
-          Order-Book Reconstruction
-                    |
-                    v
-            Data-Quality Auditing
-                    |
-                    v
-           Causal Feature Engineering
-                    |
-                    v
-             Leakage Diagnostics
-                    |
-                    v
-         Purged Walk-Forward Validation
-                    |
-                    v
-          Machine-Learning Baselines
-                    |
-                    v
-       Out-of-Sample Model Evaluation
-                    |
-          +---------+----------+
-          |         |          |
-          v         v          v
-       Regime   Confidence   Fold
-      Analysis  Intervals  Stability
-          |         |          |
-          +---------+----------+
-                    |
-                    v
-       Null + Selection-Bias Experiments
-                    |
-                    v
-           Red-Team Challenges
-                    |
-                    v
-        Reproducible Research Reports
+ Public / synthetic market data
+              |
+   Snapshot + update handling
+              |
+   Order-book reconstruction
+              |
+     Data-quality auditing
+              |
+   Causal feature engineering
+              |
+      Leakage diagnostics
+              |
+ Purged walk-forward validation  <--  naive K-fold shown as the negative control
+              |
+   Models: logistic regression, gradient boosting
+              |
+   Regimes | Confidence intervals | Fold stability | Calibration
+              |
+ Null + selection-bias experiments, Red-Team challenges
+              |
+     Reproducible reports
 ```
 
-## 3. Market-data integration
+### Leakage-aware validation
 
-### Coinbase REST Level 2 snapshot
+Random cross-validation misleads on time series when label windows overlap. Leakguard provides chronological walk-forward folds, purging of training labels that overlap the test window, a configurable embargo, label-overlap diagnostics, and a naive K-fold comparison so the inflation is measured, not assumed.
 
-Leakguard includes a public Coinbase Exchange REST adapter.
+### Causal features
 
-It:
+Spread, level-one and multi-level imbalance, rolling imbalance, microprice, short returns, rolling volatility and spread in basis points. A truncation test checks that each feature at row *t* does not change when the future is removed. A deliberately leaky feature proves the test can catch a problem. This is a practical diagnostic, not a proof that no leakage exists.
 
-- Retrieves a Level 2 order-book snapshot.
-- Validates the returned response.
-- Preserves the available exchange sequence number.
-- Normalizes bid and ask price levels.
-- Writes CSV data and JSON metadata.
+### Label and horizon choices
 
-Example:
+- **Ties are dropped by default.** If the mid-price did not move over the horizon, the row is removed so the label means "up vs down". Use `--keep-ties` for the old behaviour. Each report prints the share of tied rows.
+- **Time-based horizon.** `--horizon-ms 5000` predicts five seconds ahead instead of 50 rows ahead. Purging automatically covers the longest label window.
+- **Both models balance classes**, so the 0.5 threshold means the same thing for each.
+- **The cost diagnostic uses non-overlapping positions**, one per horizon, so returns are not counted many times over.
+
+### Statistical reliability
+
+- Volatility regimes (low, normal, high) with thresholds taken from the training folds only.
+- Circular moving-block bootstrap intervals for AUC, accuracy and Brier.
+- Fold-by-fold stability: mean, standard deviation, minimum, maximum.
+- Calibration error and Brier, with the 0.25 constant-forecast baseline stated in the report.
+
+These are approximate diagnostics, not guarantees of independence or generalisation.
+
+### Null experiments, selection bias and Red-Team
 
 ```bash
-python -m leakguard.market_data \
-  --product BTC-USD \
-  --depth 10 \
-  --out data/coinbase_btc_usd_snapshot.csv
+python -m leakguard.null_experiments --observations 1000 --repetitions 500 --seed 7
+python -m leakguard.selection_bias --n-observations 300 --n-trials 20 --repetitions 30 --seed 7
+python -m leakguard.redteam --n 1200 --seed 7
 ```
 
-### Coinbase Advanced Trade Level 2 WebSocket
+- **Null experiment:** random labels and scores give the chance-level AUC distribution.
+- **Selection bias:** picking the best of many random predictors produces an impressive-looking AUC with no signal.
+- **Red-Team:** injected faults (duplicate or out-of-order timestamps, missing values, crossed books, negative sizes, future-dependent features) plus clean controls. The pass rate covers only the implemented cases, not arbitrary real-world corruption.
 
-Leakguard also includes a public WebSocket collector.
+### Reproduction: order flow imbalance
 
-It:
-
-- Connects to the Coinbase Advanced Trade WebSocket feed.
-- Subscribes to Level 2 market data.
-- Initializes the local order book from a snapshot.
-- Applies incremental price-level updates.
-- Handles absolute size updates and zero-size deletions.
-- Records captured book states.
-- Saves CSV data and JSON capture metadata.
-
-Example:
+`leakguard/ofi_reproduction.py` computes level-1 order flow imbalance, regresses mid-price change on it inside fixed time bins, and also regresses the *next* bin's change on it.
 
 ```bash
-python -m leakguard.coinbase_ws \
-  --product BTC-USD \
-  --duration 300 \
-  --out results/coinbase_ws_capture.csv
+python -m leakguard.ofi_reproduction --data results/coinbase_normalized.csv --bin-ms 10000
 ```
 
-No exchange API credentials are required for the public market-data collection workflow.
+Differences from the paper are listed inside the generated report. The main ones: the paper uses event-by-event NYSE data for many stocks, while this repo uses fixed-grid snapshots of one crypto product.
 
-### Automated real-data research workflow
-
-The repository includes a manually triggered GitHub Actions workflow:
-
-`.github/workflows/coinbase_research_pipeline.yml`
-
-It runs the following sequence:
-
-1. Installs the Python dependencies.
-2. Runs the automated test suite.
-3. Captures Coinbase Advanced Trade Level 2 data.
-4. Normalizes the captured data.
-5. Audits data quality.
-6. Runs the research experiment on the normalized data.
-7. Runs the Red-Team challenge suite.
-8. Publishes a workflow summary.
-9. Uploads the generated research artifacts.
-
-Run it from:
-
-**GitHub → Actions → Coinbase Real-Data Research Pipeline → Run workflow**
-
-The workflow accepts a Coinbase product and capture duration.
-
-Generated artifacts include capture metadata, normalized data, data-quality reports, experiment reports, and Red-Team reports.
-
-### Market-data limitations
-
-The Coinbase collector records local arrival order and exchange timestamps where available. Its local message index is not an exchange sequence number.
-
-The current collector does not automatically reconnect, recover missed messages, or resume from a new snapshot.
-
-The collection and normalization pipeline should not be interpreted as a complete exchange-grade feed handler.
-
-## 4. Order-book reconstruction and integrity
-
-Leakguard includes an exchange-neutral normalized order-book reconstruction interface.
-
-It supports:
-
-- Initial snapshots.
-- Incremental price-level updates.
-- Price-level insertion and replacement.
-- Zero-size price-level deletion.
-- Snapshot sequence tracking.
-- Missing sequence detection.
-- Duplicate update detection.
-- Out-of-order update detection.
-
-It also checks market-data integrity, including:
-
-- Missing values.
-- Duplicate timestamps.
-- Out-of-order timestamps.
-- Invalid prices and sizes.
-- Crossed order books.
-
-The generic reconstruction interface is separate from the Coinbase-specific collector. Its sequence checks should not be confused with exchange-level sequence recovery.
-
-## 5. Causal microstructure features
-
-The feature pipeline includes:
-
-- Bid-ask spread.
-- Level-one order-book imbalance.
-- Multi-level depth imbalance.
-- Rolling imbalance.
-- Microprice.
-- Short-horizon returns.
-- Rolling volatility.
-- Spread in basis points.
-
-Leakguard also includes a deliberately leaky feature for testing whether its causality diagnostics can identify future-dependent information.
-
-The causality diagnostic compares feature outputs across complete and truncated input histories.
-
-This is a practical diagnostic, not a mathematical proof that every possible leakage mechanism has been eliminated.
-
-## 6. Leakage-aware validation
-
-Random cross-validation can produce misleading results for time-series prediction when label windows overlap.
-
-Leakguard includes:
-
-- Chronological walk-forward evaluation.
-- Forward-only test periods.
-- Purging of overlapping training-label windows.
-- Configurable embargo periods.
-- Naive K-fold comparison.
-- Label-overlap diagnostics.
-
-The purpose is to reduce artificially optimistic model evaluation caused by temporal leakage.
-
-## 7. Machine-learning baselines
-
-The experiment pipeline compares:
-
-- Logistic Regression.
-- Histogram-based Gradient Boosting.
-
-Evaluation metrics include:
-
-- ROC AUC.
-- Accuracy.
-- Balanced accuracy.
-- Brier score.
-
-The pipeline produces out-of-sample predictions and fold-level metrics.
-
-## 8. Statistical reliability
-
-A model's average score alone does not tell the whole story.
-
-Leakguard includes several additional diagnostics.
-
-### Volatility-regime evaluation
-
-The research pipeline evaluates predictions across:
-
-- Low-volatility conditions.
-- Normal-volatility conditions.
-- High-volatility conditions.
-
-Regime thresholds are calculated from training-fold volatility and then applied to the test observations.
-
-This avoids using the test period to determine its own regime boundaries.
-
-### Confidence intervals
-
-Leakguard implements circular moving-block bootstrap confidence intervals for selected evaluation metrics.
-
-The current experiment reports intervals for:
-
-- ROC AUC.
-- Accuracy.
-- Brier score.
-
-Blocks preserve local observation ordering better than independently resampling every observation.
-
-These are approximate uncertainty diagnostics, not guarantees of statistical independence or proof of generalization.
-
-### Fold stability
-
-The experiment reports:
-
-- Mean metric across validation folds.
-- Standard deviation.
-- Minimum.
-- Maximum.
-- Number of valid folds.
-
-This makes variation between validation periods visible instead of relying exclusively on a pooled score.
-
-## 9. Null experiments and selection bias
-
-Leakguard includes two separate controlled statistical experiments.
-
-### Independent-label null experiment
-
-Module:
-
-`leakguard/null_experiments.py`
-
-This experiment generates independent random labels and prediction scores.
-
-Because the scores contain no predictive information about the labels, the resulting AUC distribution provides a chance-level reference.
-
-Run:
-
-```bash
-python -m leakguard.null_experiments \
-  --observations 1000 \
-  --repetitions 500 \
-  --seed 7
-```
-
-The report includes:
-
-- Mean and median AUC.
-- AUC standard deviation.
-- 2.5th and 97.5th percentiles.
-- Fraction of trials with AUC at least 0.60.
-- Counts above, below, and equal to 0.50.
-
-These percentiles describe the simulated null distribution. They are not confidence intervals for a real market model.
-
-### Multiple-trial selection-bias experiment
-
-Module:
-
-`leakguard/selection_bias.py`
-
-This experiment evaluates multiple independent random predictors against random labels and selects the best observed AUC.
-
-It demonstrates how selecting the best result from many experiments can produce an apparently strong score even when no genuine predictive signal exists.
-
-Run:
-
-```bash
-python -m leakguard.selection_bias \
-  --n-observations 300 \
-  --n-trials 20 \
-  --repetitions 30 \
-  --seed 7
-```
-
-The report includes:
-
-- Mean selected AUC.
-- Median selected AUC.
-- 95th percentile selected AUC.
-- Mean unselected trial AUC.
-- Selection uplift relative to the theoretical null AUC.
-- Repetitions in which the selected result exceeds the null.
-
-These are controlled synthetic demonstrations. They do not reproduce every form of multiple testing, temporal dependence, or financial non-stationarity.
-
-## 10. Red-Team validation
-
-Module:
-
-`leakguard/redteam.py`
-
-Leakguard includes controlled fault-injection challenges that test whether known data-integrity and feature-causality problems are detected.
-
-Challenge cases include:
-
-- Duplicate timestamps.
-- Out-of-order timestamps.
-- Missing market values.
-- Crossed order books.
-- Negative order sizes.
-- Deliberately future-dependent features.
-
-Clean controls are included to check that valid synthetic inputs are not incorrectly flagged.
-
-Run:
-
-```bash
-python -m leakguard.redteam \
-  --n 1200 \
-  --seed 7
-```
-
-The report records:
-
-- Challenge cases.
-- Expected detections.
-- Observed detections.
-- Passed and failed cases.
-- Overall challenge pass rate.
-
-The pass rate applies only to the explicitly implemented challenge cases. It is not a general estimate of detection recall or proof that arbitrary real-world market-data corruption will be detected.
-
-## 11. Runtime and memory benchmarks
-
-Module:
-
-`leakguard/benchmark.py`
-
-Leakguard includes a reproducible benchmark for:
-
-1. Synthetic order-book generation.
-2. Causal feature construction.
-
-Default benchmark sizes:
-
-- 10,000 rows.
-- 30,000 rows.
-- 60,000 rows.
-
-Run:
+### Benchmarks
 
 ```bash
 python -m leakguard.benchmark
 ```
 
-Custom row counts:
+Measures synthetic generation and feature construction time and Python-tracked memory. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for methodology and limits.
+
+## Market data
+
+Public Coinbase adapters need no credentials.
 
 ```bash
-python -m leakguard.benchmark --rows 5000 20000 100000
+# REST Level 2 snapshot
+python -m leakguard.market_data --product BTC-USD --depth 10 --out data/coinbase_btc_usd_snapshot.csv
+
+# Advanced Trade Level 2 WebSocket capture
+python -m leakguard.coinbase_ws --product BTC-USD --duration 300 --out results/coinbase_ws_capture.csv
+
+# Put a capture on a fixed time grid (default 100 ms)
+python -m leakguard.coinbase_normalize --input results/coinbase_ws_capture.csv --out results/coinbase_normalized.csv
+
+# Audit the normalized data
+python -m leakguard.data_quality --input results/coinbase_normalized.csv --out results/data_quality --expected-interval-ms 100
 ```
 
-The benchmark records:
+### Real-data workflow
 
-- Generation wall time.
-- Feature-construction wall time.
-- Python-tracked peak memory.
-- Input DataFrame memory.
-- Feature DataFrame memory.
-- Python and dependency versions.
-- Random seed.
+**GitHub → Actions → Coinbase Real-Data Research Pipeline → Run workflow** (default: BTC-USD, 900 seconds).
 
-Reports:
+It runs the tests, captures Level 2 data, normalizes it, audits quality, runs the experiment with a 5-second horizon, runs the order-flow-imbalance reproduction and the Red-Team suite, then commits the reports to `reports/real_capture_run_<n>/`. Full artifacts stay on the run page for 30 days.
 
-```text
-results/
-    benchmarks/
-        latest.json
-        latest.md
-```
-
-Wall time is measured using `time.perf_counter`.
-
-Peak traced memory is measured using Python's `tracemalloc`. This is not total process resident memory.
-
-These benchmarks cover synthetic generation and feature construction. They do not measure model-training throughput, exchange-feed throughput, network latency, or production trading capacity.
-
-See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the measurement methodology and limitations.
-
-## 12. Installation
-
-Requires Python and the dependencies listed in `requirements.txt`.
-
-Create a virtual environment:
+### Running on your own data
 
 ```bash
-python -m venv .venv
+python -m leakguard.experiment --data data/normalized_order_book.csv --horizon-ms 5000 --splits 5 --fee-bps 1 --slippage-bps 1
 ```
 
-Activate it on Windows PowerShell:
+Required columns: `ts_ms`, `bid_px_1`, `ask_px_1`, `bid_sz_1`, `ask_sz_1`. Optional depth: `bid_px_2/3`, `ask_px_2/3`, `bid_sz_2/3`, `ask_sz_2/3`. Timestamps must be ascending and unique, prices and sizes in consistent units, best bid below best ask, and at least 500 rows. Raw captures must be normalized first.
 
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-Install dependencies:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-## 13. Running the research experiment
-
-### Synthetic experiment
-
-```bash
-python -m leakguard.experiment \
-  --n 30000 \
-  --horizon 50
-```
-
-### Experiment using normalized order-book data
-
-```bash
-python -m leakguard.experiment \
-  --data data/normalized_order_book.csv \
-  --horizon 50 \
-  --splits 5 \
-  --fee-bps 1 \
-  --slippage-bps 1
-```
-
-The normalized CSV input requires:
-
-```text
-ts_ms
-bid_px_1
-ask_px_1
-bid_sz_1
-ask_sz_1
-```
-
-Optional additional depth columns:
-
-```text
-bid_px_2
-ask_px_2
-bid_sz_2
-ask_sz_2
-bid_px_3
-ask_px_3
-bid_sz_3
-ask_sz_3
-```
-
-Each row must represent one consistently sampled order-book observation.
-
-Timestamps must be ascending and unique. Prices and sizes must use consistent units. The best bid must be below the best ask.
-
-The raw REST snapshot and WebSocket capture outputs should not be assumed to be directly compatible with the experiment loader. They must pass through the normalization process first.
-
-The prediction horizon is measured in observations, not automatically in seconds. Its time interpretation depends on the sampling interval of the input data.
-
-## 14. Research reports
-
-The experiment pipeline generates Markdown and JSON reports containing:
-
-- Data-source information.
-- Input row counts.
-- Data fingerprint.
-- Integrity diagnostics.
-- Feature-causality results.
-- Purged validation information.
-- Out-of-sample model metrics.
-- Confidence intervals.
-- Volatility-regime results.
-- Fold-stability summaries.
-- Simplified cost diagnostics.
-
-Other modules generate separate reports for:
-
-- Null experiments.
-- Selection-bias experiments.
-- Red-Team challenges.
-- Runtime and memory benchmarks.
-- Data-quality audits.
-
-Reports are designed to make assumptions and limitations inspectable rather than presenting a single model score without context.
-
-## 15. Testing and continuous integration
-
-Leakguard uses automated tests and GitHub Actions.
-
-The test suite covers areas including:
-
-- Synthetic order-book generation.
-- Data-integrity checks.
-- Feature causality.
-- Deliberately leaky features.
-- Dataset construction.
-- Purged chronological validation.
-- Label-overlap diagnostics.
-- Snapshot and incremental-update reconstruction.
-- Sequence-gap, duplicate, and out-of-order detection.
-- Coinbase market-data parsing and collection behavior.
-- Normalization and data-quality auditing.
-- Statistical reliability.
-- Red-Team challenges.
-- Null experiments.
-- Selection-bias experiments.
-- Benchmark reporting.
-
-Run locally:
+## Testing and CI
 
 ```bash
 python -m pytest -q
+ruff check .
 ```
 
-GitHub Actions runs the automated CI workflow on repository changes.
+GitHub Actions runs tests, lint, the synthetic experiment and the reproduction on every push. A manual **Lint auto-fix** workflow applies safe `ruff` fixes.
 
-The project also contains manually triggered workflows for public market-data collection and the Coinbase real-data research pipeline.
+## Limitations
 
-## 16. Limitations and research boundaries
+**Important:** Leakguard is not a production HFT engine, exchange execution system, or proof of profitable trading alpha. It is an independent research-engineering prototype.
 
-Leakguard is an independent research prototype.
+It does not claim:
 
-It does not currently claim:
+- Exchange-grade feed handling, reconnection or missed-message recovery.
+- Level 3 reconstruction, queue-position estimation or partial-fill simulation.
+- Market-impact, latency or adverse-selection modelling.
+- Profitable alpha or live-trading readiness.
 
-- Production exchange connectivity or exchange-grade feed recovery.
-- Complete sequence-gap recovery for the Coinbase WebSocket collector.
-- Level 3 order-book reconstruction.
-- Queue-position estimation.
-- Realistic partial-fill simulation.
-- Market-impact modelling.
-- Latency or adverse-selection modelling.
-- Production order execution.
-- Profitable alpha.
-- Live-trading readiness.
+Statistical caveats:
 
-Additional statistical limitations:
+- Synthetic data tests the software. It is not evidence about markets.
+- A short capture (minutes to hours, one product) gives wide uncertainty.
+- The naive-vs-purged gap compares a random 80/20 split with an expanding window, so it is indicative, not a precise measure of leakage.
+- Bootstrap intervals are approximate, and fold stability does not predict the future.
+- Snapshots on a 100 ms grid miss events between snapshots.
+- The cost diagnostic is not an execution simulator.
 
-- Synthetic data does not replace extensive historical market data.
-- Bootstrap intervals are approximate.
-- Fold stability does not guarantee future stability.
-- Null experiments are controlled simulations.
-- Selection-bias experiments do not model every real-world research-selection process.
-- Red-Team results cover only known challenge cases.
-- Simplified cost diagnostics are not realistic execution simulations.
-
-The project is intended to investigate the reliability of research assumptions, not to claim that a trading strategy works.
-
-## 17. Repository structure
+## Repository structure
 
 ```text
 leakguard/
-├── .github/
-│   └── workflows/
-├── docs/
-│   └── BENCHMARKS.md
+├── .github/workflows/      CI, lint auto-fix, market-data and real-data pipelines
+├── docs/BENCHMARKS.md
 ├── leakguard/
-│   ├── benchmark.py
-│   ├── checks.py
-│   ├── coinbase_ws.py
-│   ├── coinbase_normalize.py
-│   ├── cv.py
-│   ├── data.py
-│   ├── data_quality.py
-│   ├── experiment.py
-│   ├── features.py
-│   ├── market_data.py
-│   ├── metrics.py
-│   ├── models.py
-│   ├── null_experiments.py
-│   ├── reliability.py
-│   ├── redteam.py
-│   ├── selection_bias.py
-│   └── simulate.py
+│   ├── benchmark.py  checks.py  coinbase_normalize.py  coinbase_ws.py
+│   ├── cv.py  data.py  data_quality.py  experiment.py  features.py
+│   ├── market_data.py  metrics.py  models.py  null_experiments.py
+│   ├── ofi_reproduction.py  reconstruction.py  redteam.py
+│   ├── reliability.py  selection_bias.py  simulate.py
+├── reports/                committed real-data reports
 ├── tests/
+├── LICENSE
+├── pyproject.toml
 ├── requirements.txt
 └── README.md
 ```
 
-## 18. Project objective
+## Objective
 
-Leakguard is an order-book ML research-validation toolkit built around one principle:
+A model result should not be trusted until the data, features, validation method and evaluation assumptions have been challenged. Leakguard combines market-data engineering, time-series validation, statistical diagnostics, controlled fault injection and reproducible reports into one workflow.
 
-**A model result should not be trusted until the data, features, validation methodology, and evaluation assumptions have been challenged.**
+## License
 
-The project combines market-data engineering, time-series validation, statistical diagnostics, controlled fault injection, and reproducible benchmarking into one research workflow.
-
-It is an independent engineering project demonstrating work in Python, market microstructure data handling, quantitative ML validation, testing, and research reproducibility.
-
-It is not presented as a production HFT engine or as evidence of profitable trading alpha.
+MIT. See [LICENSE](LICENSE).
